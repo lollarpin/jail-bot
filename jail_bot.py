@@ -41,6 +41,7 @@ import os
 import re
 import json
 import time
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -298,7 +299,8 @@ async def role_cmd(ctx: commands.Context, member: discord.Member, *, role_name: 
         return
 
     if role in member.roles:
-        await ctx.reply(f"{member.mention} already has **{role.name}**.", ephemeral=True)
+        await member.remove_roles(role, reason=f"Removed by {ctx.author}")
+        await ctx.reply(f"🎭 Took the **{role.name}** role away from {member.mention}.")
         return
 
     await member.add_roles(role, reason=f"Assigned by {ctx.author}")
@@ -374,35 +376,26 @@ async def jail(ctx: commands.Context, member: discord.Member, *, duration_and_re
         human = None
         duration_text = "with no time limit"
 
-    # DM the jailed member with the details
-    try:
-        embed = discord.Embed(title="Jailed", color=discord.Color.red())
-        embed.add_field(name="Server", value=guild.name, inline=False)
-        embed.add_field(name="Reason", value=reason, inline=False)
-        embed.add_field(name="Duration", value=human or "Indefinite", inline=True)
-        if release_ts:
-            embed.add_field(name="Expires", value=f"<t:{int(release_ts)}:F>", inline=True)
-        embed.add_field(name="Moderator", value=str(ctx.author), inline=False)
-        await member.send(embed=embed)
-    except discord.Forbidden:
-        pass  # member has DMs off, no big deal
+    embed = discord.Embed(title="Jailed", color=discord.Color.red())
+    embed.add_field(name="Server", value=guild.name, inline=False)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    embed.add_field(name="Duration", value=human or "Indefinite", inline=True)
+    if release_ts:
+        embed.add_field(name="Expires", value=f"<t:{int(release_ts)}:F>", inline=True)
+    embed.add_field(name="Moderator", value=str(ctx.author), inline=False)
 
-    # public taunt in the channel where the command was actually run
-    try:
-        await ctx.send(f"{member.mention} sa oblo ka muna tangahin! 🤣")
-    except discord.Forbidden:
-        pass
+    async def safe(coro):
+        try:
+            await coro
+        except discord.Forbidden:
+            pass
 
-    await ctx.reply(f"🔒 {member.mention} jailed {duration_text}. Reason: {reason}", ephemeral=True)
-
-    # explanation message posted in the jail channel itself, for the jailed member
-    try:
-        if human:
-            await jail_channel.send(f"{member.mention}, you have been jailed for {human}. Reason: {reason}")
-        else:
-            await jail_channel.send(f"{member.mention}, you have been jailed. Reason: {reason}")
-    except discord.Forbidden:
-        pass
+    # fire all three off at once instead of one after another, to cut down wait time
+    await asyncio.gather(
+        safe(member.send(embed=embed)),
+        safe(ctx.send(f"{member.mention} sa oblo ka muna tangahin! 🤣")),
+        safe(jail_channel.send(f"🔒 {member.mention} jailed {duration_text}. Reason: {reason}")),
+    )
 
 
 @bot.hybrid_command(name="unjail", description="Release a member from jail.")
