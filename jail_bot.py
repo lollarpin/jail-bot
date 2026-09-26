@@ -224,6 +224,8 @@ async def jailsetup(ctx: commands.Context, channel: discord.TextChannel):
         await ctx.reply("You need Manage Roles or Administrator permission to do that.", ephemeral=True)
         return
 
+    await ctx.defer(ephemeral=True)
+
     guild = ctx.guild
     jailed_role = await get_or_create_jailed_role(guild)
 
@@ -289,13 +291,15 @@ async def role_cmd(ctx: commands.Context, member: discord.Member, *, role_name: 
 # ---------- jail / unjail ----------
 
 async def lock_out_other_channels(guild: discord.Guild, jailed_role: discord.Role, jail_channel_id: int):
+    failed = []
     for channel in guild.channels:
         if channel.id == jail_channel_id:
             continue
         try:
             await channel.set_permissions(jailed_role, view_channel=False)
         except discord.Forbidden:
-            pass
+            failed.append(channel.name)
+    return failed
 
 
 @bot.hybrid_command(
@@ -327,10 +331,14 @@ async def jail(ctx: commands.Context, member: discord.Member, *, duration_and_re
         await ctx.reply("You can't jail someone with an equal or higher role than you.", ephemeral=True)
         return
 
+    # defer immediately: locking channels one by one can take longer than
+    # Discord's 3-second reply window, so ack now to avoid "Unknown interaction"
+    await ctx.defer(ephemeral=True)
+
     duration_seconds, reason = parse_duration_and_reason(duration_and_reason)
 
     jailed_role = await get_or_create_jailed_role(guild)
-    await lock_out_other_channels(guild, jailed_role, jail_channel.id)
+    failed_channels = await lock_out_other_channels(guild, jailed_role, jail_channel.id)
     await member.add_roles(jailed_role, reason=reason)
 
     release_ts = time.time() + duration_seconds if duration_seconds else None
@@ -344,13 +352,29 @@ async def jail(ctx: commands.Context, member: discord.Member, *, duration_and_re
         human = None
         duration_text = "with no time limit"
 
+    # DM the jailed member with the details
+    try:
+        embed = discord.Embed(title="Jailed", color=discord.Color.red())
+        embed.add_field(name="Server", value=guild.name, inline=False)
+        embed.add_field(name="Reason", value=reason, inline=False)
+        embed.add_field(name="Duration", value=human or "Indefinite", inline=True)
+        if release_ts:
+            embed.add_field(name="Expires", value=f"<t:{int(release_ts)}:F>", inline=True)
+        embed.add_field(name="Moderator", value=str(ctx.author), inline=False)
+        await member.send(embed=embed)
+    except discord.Forbidden:
+        pass  # member has DMs off, no big deal
+
     # public taunt in the channel where the command was actually run
     try:
         await ctx.send(f"{member.mention} sa oblo ka muna tangahin! 🤣")
     except discord.Forbidden:
         pass
 
-    await ctx.reply(f"🔒 {member.mention} jailed {duration_text}. Reason: {reason}", ephemeral=True)
+    reply_text = f"🔒 {member.mention} jailed {duration_text}. Reason: {reason}"
+    if failed_channels:
+        reply_text += f"\n⚠️ Couldn't lock these channels (check my permissions there): {', '.join(failed_channels)}"
+    await ctx.reply(reply_text, ephemeral=True)
 
     # explanation message posted in the jail channel itself, for the jailed member
     try:
