@@ -15,20 +15,26 @@ SETUP
    !removeadminrole @role     - remove that role's permission
    !setprefix v                - change the prefix (default: !)
    !jailsetup #channel        - set which channel is used as the jail
+                                (this also locks every other channel for the
+                                 Jailed role, once, so jail/unjail stay fast)
 
 USAGE (once prefix is set to "v" and jail channel + admin role are set up):
    v jail @Dan 27 days spamming     -> jails Dan for 27 days, reason "spamming"
    v jail @Dan spamming             -> jails Dan with no time limit
    v jail @Dan                      -> jails Dan, no duration, no reason
-   v unjail @Dan                    -> releases Dan early
+   v unjail @Dan                    -> releases Dan and restores his old roles
    v role @Dan chongkids            -> gives Dan the "chongkids" role (typed as plain text)
    vrole @Dan chongkids             -> same as above, no space needed between prefix and command
 
 Accepted duration units: minute(s)/min/m, hour(s)/hr/h, day(s)/d, week(s)/w
 
-The bot auto-creates a "Jailed" role the first time it's needed.
+Jailing a member strips ALL of their current roles and leaves only "Jailed" —
+their original roles are saved and restored automatically on unjail (manual
+or automatic, once the duration expires).
+The bot auto-creates the "Jailed" role the first time it's needed.
 You still need to designate the jail channel yourself with jailsetup.
-Make sure the bot's own role is ABOVE the "Jailed" role in Server Settings > Roles.
+Make sure the bot's own role is ABOVE every role you might jail someone with,
+including "Jailed", in Server Settings > Roles.
 """
 
 import os
@@ -68,7 +74,7 @@ def get_guild_config(guild_id: int) -> dict:
             "prefix": DEFAULT_PREFIX,
             "admin_roles": [],
             "jail_channel_id": None,
-            "active_jails": {},  # member_id (str) -> release unix timestamp, or None for permanent
+            "active_jails": {},  # member_id (str) -> {"release_ts": float|None, "saved_roles": [role_id,...]}
         }
         save_config(config)
     return config[gid]
@@ -78,7 +84,11 @@ async def get_prefix(bot, message):
     if message.guild is None:
         return DEFAULT_PREFIX
     gc = get_guild_config(message.guild.id)
-    return commands.when_mentioned_or(gc["prefix"])(bot, message)
+    p = gc["prefix"]
+    # check the "prefix + space" form FIRST so "v jail" parses correctly;
+    # discord.py doesn't auto-skip a space after the prefix otherwise,
+    # which is why commands typed with a space were silently doing nothing.
+    return commands.when_mentioned_or(f"{p} ", p)(bot, message)
 
 
 # ---------- bot setup ----------
@@ -164,12 +174,14 @@ async def check_expired_jails():
         jailed_role = discord.utils.get(guild.roles, name=JAILED_ROLE_NAME)
         if jailed_role is None:
             continue
-        expired = [mid for mid, ts in gc["active_jails"].items() if ts is not None and ts <= now]
+        expired = [mid for mid, data in gc["active_jails"].items() if data.get("release_ts") is not None and data["release_ts"] <= now]
         for mid in expired:
             member = guild.get_member(int(mid))
             if member and jailed_role in member.roles:
+                saved_ids = gc["active_jails"][mid].get("saved_roles", [])
+                restored = [guild.get_role(rid) for rid in saved_ids if guild.get_role(rid)]
                 try:
-                    await member.remove_roles(jailed_role, reason="Jail duration expired")
+                    await member.edit(roles=restored, reason="Jail duration expired")
                 except discord.Forbidden:
                     pass
             gc["active_jails"].pop(mid, None)
@@ -238,7 +250,12 @@ async def jailsetup(ctx: commands.Context, channel: discord.TextChannel):
     )
     await channel.set_permissions(guild.default_role, view_channel=True)
 
-    await ctx.reply(f"Jail channel set to {channel.mention}", ephemeral=True)
+    failed_channels = await lock_out_other_channels(guild, jailed_role, channel.id)
+
+    reply_text = f"Jail channel set to {channel.mention}. All other channels are now locked for the Jailed role."
+    if failed_channels:
+        reply_text += f"\n⚠️ Couldn't lock these (check my permissions there): {', '.join(failed_channels)}"
+    await ctx.reply(reply_text, ephemeral=True)
 
 
 # ---------- role assignment ----------
@@ -331,18 +348,23 @@ async def jail(ctx: commands.Context, member: discord.Member, *, duration_and_re
         await ctx.reply("You can't jail someone with an equal or higher role than you.", ephemeral=True)
         return
 
-    # defer immediately: locking channels one by one can take longer than
-    # Discord's 3-second reply window, so ack now to avoid "Unknown interaction"
+    # defer immediately as a safety net in case of network latency
     await ctx.defer(ephemeral=True)
 
     duration_seconds, reason = parse_duration_and_reason(duration_and_reason)
 
     jailed_role = await get_or_create_jailed_role(guild)
-    failed_channels = await lock_out_other_channels(guild, jailed_role, jail_channel.id)
-    await member.add_roles(jailed_role, reason=reason)
+
+    # save every role they currently have (except @everyone and roles higher than
+    # or equal to the bot's own, which the bot can't touch anyway) so we can
+    # restore them on unjail, then swap them down to ONLY the Jailed role.
+    # This is a single API call and avoids other roles' permissions overriding
+    # the Jailed role's channel restrictions.
+    saved_role_ids = [r.id for r in member.roles if r.id != guild.id]
+    await member.edit(roles=[jailed_role], reason=reason)
 
     release_ts = time.time() + duration_seconds if duration_seconds else None
-    gc["active_jails"][str(member.id)] = release_ts
+    gc["active_jails"][str(member.id)] = {"release_ts": release_ts, "saved_roles": saved_role_ids}
     save_config(config)
 
     if duration_seconds:
@@ -371,10 +393,7 @@ async def jail(ctx: commands.Context, member: discord.Member, *, duration_and_re
     except discord.Forbidden:
         pass
 
-    reply_text = f"🔒 {member.mention} jailed {duration_text}. Reason: {reason}"
-    if failed_channels:
-        reply_text += f"\n⚠️ Couldn't lock these channels (check my permissions there): {', '.join(failed_channels)}"
-    await ctx.reply(reply_text, ephemeral=True)
+    await ctx.reply(f"🔒 {member.mention} jailed {duration_text}. Reason: {reason}", ephemeral=True)
 
     # explanation message posted in the jail channel itself, for the jailed member
     try:
@@ -398,10 +417,21 @@ async def unjail(ctx: commands.Context, member: discord.Member):
         await ctx.reply(f"{member.mention} isn't jailed.", ephemeral=True)
         return
 
-    await member.remove_roles(jailed_role, reason=f"Unjailed by {ctx.author}")
+    await ctx.defer(ephemeral=True)
+
     gc = get_guild_config(ctx.guild.id)
+    jail_data = gc["active_jails"].get(str(member.id), {})
+    saved_ids = jail_data.get("saved_roles", [])
+    restored = [ctx.guild.get_role(rid) for rid in saved_ids if ctx.guild.get_role(rid)]
+
+    await member.edit(roles=restored, reason=f"Unjailed by {ctx.author}")
     gc["active_jails"].pop(str(member.id), None)
     save_config(config)
+
+    try:
+        await ctx.send(f"🔓 mag pa rehab ka tangahin!")
+    except discord.Forbidden:
+        pass
 
     await ctx.reply(f"🔓 {member.mention} has been released.", ephemeral=True)
 
