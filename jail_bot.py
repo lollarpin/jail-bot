@@ -5,7 +5,7 @@ Admins can "jail" a member so they can only see one designated jail channel,
 optionally for a set amount of time (auto-released after it passes).
 
 SETUP
-1. pip install discord.py
+1. pip install discord.py PyNaCl   (PyNaCl is required for voice / VC features)
 2. Set your bot token as an environment variable: DISCORD_BOT_TOKEN
 3. Run: python jail_bot.py
 4. Works immediately for anyone with "Manage Roles" or Administrator permission.
@@ -17,13 +17,17 @@ SETUP
    !jailsetup #channel        - set which channel is used as the jail
                                 (this also locks every other channel for the
                                  Jailed role, once, so jail/unjail stay fast)
+   !vcjoin #voicechannel      - bot joins and stays in that VC permanently,
+                                even if everyone else leaves; auto-rejoins if
+                                disconnected (restart, network drop, etc.)
+   !vcleave                   - bot leaves the VC and stops auto-rejoining
 
 USAGE (once prefix is set to "v" and jail channel + admin role are set up):
    v jail @Dan 27 days spamming     -> jails Dan for 27 days, reason "spamming"
    v jail @Dan spamming             -> jails Dan with no time limit
    v jail @Dan                      -> jails Dan, no duration, no reason
    v unjail @Dan                    -> releases Dan and restores his old roles
-   v role @Dan chongkids            -> gives Dan the "chongkids" role (typed as plain text)
+   v role @Dan chongkids            -> toggles the "chongkids" role on Dan (plain text, no @ needed)
    vrole @Dan chongkids             -> same as above, no space needed between prefix and command
 
 Accepted duration units: minute(s)/min/m, hour(s)/hr/h, day(s)/d, week(s)/w
@@ -76,6 +80,7 @@ def get_guild_config(guild_id: int) -> dict:
             "admin_roles": [],
             "jail_channel_id": None,
             "active_jails": {},  # member_id (str) -> {"release_ts": float|None, "saved_roles": [role_id,...]}
+            "voice_channel_id": None,  # VC the bot should stay connected to permanently
         }
         save_config(config)
     return config[gid]
@@ -162,7 +167,49 @@ async def on_ready():
         print(f"Sync failed: {e}")
     if not check_expired_jails.is_running():
         check_expired_jails.start()
+
+    # reconnect to any VC we're supposed to be permanently in
+    for gid, gc in config.items():
+        vc_id = gc.get("voice_channel_id")
+        if not vc_id:
+            continue
+        guild = bot.get_guild(int(gid))
+        if guild is None:
+            continue
+        channel = guild.get_channel(vc_id)
+        if channel and guild.voice_client is None:
+            try:
+                await channel.connect(reconnect=True, self_deaf=True)
+            except discord.ClientException:
+                pass
+
     print(f"Logged in as {bot.user}")
+
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    # if the BOT itself got disconnected from its permanent VC, rejoin immediately
+    if member.id != bot.user.id:
+        return
+    if after.channel is not None:
+        return  # still connected somewhere, nothing to do
+
+    guild = member.guild
+    gc = get_guild_config(guild.id)
+    vc_id = gc.get("voice_channel_id")
+    if not vc_id:
+        return  # bot isn't supposed to be permanently in a VC here
+
+    channel = guild.get_channel(vc_id)
+    if channel is None:
+        return
+
+    await asyncio.sleep(2)  # brief pause before reconnecting
+    try:
+        if guild.voice_client is None:
+            await channel.connect(reconnect=True, self_deaf=True)
+    except discord.ClientException:
+        pass
 
 
 @tasks.loop(seconds=60)
@@ -257,6 +304,49 @@ async def jailsetup(ctx: commands.Context, channel: discord.TextChannel):
     if failed_channels:
         reply_text += f"\n⚠️ Couldn't lock these (check my permissions there): {', '.join(failed_channels)}"
     await ctx.reply(reply_text, ephemeral=True)
+
+
+@bot.hybrid_command(name="vcjoin", description="Join a voice channel and stay in it permanently.")
+@app_commands.describe(channel="The voice channel to join and stay in")
+async def vcjoin(ctx: commands.Context, channel: discord.VoiceChannel):
+    if not is_setup_permitted(ctx.author):
+        await ctx.reply("You need Manage Roles or Administrator permission to do that.", ephemeral=True)
+        return
+
+    await ctx.defer(ephemeral=True)
+
+    guild = ctx.guild
+    if guild.voice_client is not None:
+        await guild.voice_client.move_to(channel)
+    else:
+        try:
+            await channel.connect(reconnect=True, self_deaf=True)
+        except discord.ClientException as e:
+            await ctx.reply(f"Couldn't join: {e}", ephemeral=True)
+            return
+
+    gc = get_guild_config(guild.id)
+    gc["voice_channel_id"] = channel.id
+    save_config(config)
+
+    await ctx.reply(f"🔊 Joined {channel.mention} and will stay there permanently, even if empty.", ephemeral=True)
+
+
+@bot.hybrid_command(name="vcleave", description="Leave the voice channel and stop staying in it.")
+async def vcleave(ctx: commands.Context):
+    if not is_setup_permitted(ctx.author):
+        await ctx.reply("You need Manage Roles or Administrator permission to do that.", ephemeral=True)
+        return
+
+    gc = get_guild_config(ctx.guild.id)
+    gc["voice_channel_id"] = None
+    save_config(config)
+
+    if ctx.guild.voice_client is not None:
+        await ctx.guild.voice_client.disconnect(force=True)
+        await ctx.reply("🔇 Left the voice channel.", ephemeral=True)
+    else:
+        await ctx.reply("I wasn't in a voice channel here.", ephemeral=True)
 
 
 # ---------- role assignment ----------
