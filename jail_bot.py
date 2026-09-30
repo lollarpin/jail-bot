@@ -316,14 +316,22 @@ async def vcjoin(ctx: commands.Context, channel: discord.VoiceChannel):
     await ctx.defer(ephemeral=True)
 
     guild = ctx.guild
-    if guild.voice_client is not None:
-        await guild.voice_client.move_to(channel)
-    else:
-        try:
-            await channel.connect(reconnect=True, self_deaf=True)
-        except discord.ClientException as e:
-            await ctx.reply(f"Couldn't join: {e}", ephemeral=True)
-            return
+    try:
+        if guild.voice_client is not None:
+            await asyncio.wait_for(guild.voice_client.move_to(channel), timeout=15)
+        else:
+            await channel.connect(reconnect=True, self_deaf=True, timeout=15)
+    except asyncio.TimeoutError:
+        await ctx.reply(
+            "Timed out connecting to the voice channel. This usually means the "
+            "server hosting the bot is blocking the connection Discord voice needs "
+            "(common on Railway/free hosts) — check the pinned message for details.",
+            ephemeral=True,
+        )
+        return
+    except Exception as e:
+        await ctx.reply(f"Couldn't join: {e}", ephemeral=True)
+        return
 
     gc = get_guild_config(guild.id)
     gc["voice_channel_id"] = channel.id
